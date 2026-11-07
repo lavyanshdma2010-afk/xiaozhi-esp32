@@ -1,0 +1,32 @@
+name: Build Zara firmware
+
+# UNTESTED: based on the project's own build.yml (same ESP-IDF image and
+# the same scripts/build.py call). Builds only the Zara board variant.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Zara board
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v6.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build Zara variant
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          python scripts/build.py bread-compact-wifi-lcd --name zara-esp32s3-cam
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: zara-firmware
+          path: build/merged-binary.bin
+          if-no-files-found: error
