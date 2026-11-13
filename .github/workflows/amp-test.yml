@@ -1,0 +1,155 @@
+name: Build Zara amp test
+
+# UNTESTED. Builds a tiny speaker-test firmware (beep + melody) for ESP32-S3
+# and uploads zara-amp-test.bin, to be flashed at offset 0x0.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v6.1
+    steps:
+      - name: Create project and build
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          mkdir -p amptest/main && cd amptest
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+          project(zara_amp_test)
+          EOF
+          cat > main/CMakeLists.txt <<'EOF'
+          idf_component_register(SRCS "main.c" REQUIRES esp_driver_i2s esp_driver_gpio)
+          EOF
+          cat > sdkconfig.defaults <<'EOF'
+          CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+          CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+          EOF
+          cat > main/main.c <<'EOF'
+          // Zara AMP TEST - plays a 1 kHz beep, then a short melody, forever.
+          // ESP32-S3 + MAX98357A. UNTESTED: not compiled or run on hardware.
+          //
+          // Wiring (change the three pins below if your board needs different ones):
+          //   MAX98357A BCLK -> GPIO 40
+          //   MAX98357A LRC  -> GPIO 41
+          //   MAX98357A DIN  -> GPIO 38
+          //   MAX98357A VIN  -> 5V, GND -> GND
+          //   SD pin: leave unconnected (never to GND, that mutes the amp)
+          //   Speaker (one only): SPK+ / SPK-
+          //
+          // The same sound is sent to BOTH I2S channels, so the amp's channel
+          // selection (SD pin) does not matter for this test.
+
+          #include <math.h>
+          #include <stdint.h>
+          #include <stddef.h>
+          #include "freertos/FreeRTOS.h"
+          #include "freertos/task.h"
+          #include "driver/i2s_std.h"
+          #include "driver/gpio.h"
+          #include "esp_log.h"
+
+          #define PIN_BCLK GPIO_NUM_40
+          #define PIN_LRC  GPIO_NUM_41
+          #define PIN_DIN  GPIO_NUM_38
+
+          #define SAMPLE_RATE 24000
+          #define VOLUME      0.25f
+          #define CHUNK       256
+          #define TWO_PI_F    6.2831853f
+
+          static const char *TAG = "amp_test";
+          static i2s_chan_handle_t tx_handle;
+
+          static void play_tone(float freq, int ms)
+          {
+              static int16_t buf[CHUNK * 2];
+              static float phase = 0.0f;
+              const int total = SAMPLE_RATE * ms / 1000;
+              const int fade = SAMPLE_RATE / 200;  // 5 ms fade in/out avoids clicks
+              const float step = TWO_PI_F * freq / SAMPLE_RATE;
+              int done = 0;
+
+              while (done < total) {
+                  int n = total - done;
+                  if (n > CHUNK) n = CHUNK;
+                  for (int i = 0; i < n; i++) {
+                      int idx = done + i;
+                      float env = 1.0f;
+                      if (idx < fade) env = (float)idx / fade;
+                      else if (idx > total - fade) env = (float)(total - idx) / fade;
+                      int16_t s = (int16_t)(sinf(phase) * 32767.0f * VOLUME * env);
+                      phase += step;
+                      if (phase > TWO_PI_F) phase -= TWO_PI_F;
+                      buf[2 * i] = s;      // left
+                      buf[2 * i + 1] = s;  // right
+                  }
+                  size_t written = 0;
+                  i2s_channel_write(tx_handle, buf, n * 2 * sizeof(int16_t), &written, portMAX_DELAY);
+                  done += n;
+              }
+          }
+
+          static void play_melody(void)
+          {
+              // Twinkle twinkle little star
+              const float C = 262, D = 294, E = 330, F = 349, G = 392, A = 440;
+              const float notes[] = {C, C, G, G, A, A, G,  F, F, E, E, D, D, C};
+              for (size_t i = 0; i < sizeof(notes) / sizeof(notes[0]); i++) {
+                  int len = (i == 6 || i == 13) ? 700 : 350;
+                  play_tone(notes[i], len);
+                  play_tone(0, 60);
+              }
+          }
+
+          void app_main(void)
+          {
+              i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+              ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, NULL));
+
+              i2s_std_config_t std_cfg = {
+                  .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+                  .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+                  .gpio_cfg = {
+                      .mclk = I2S_GPIO_UNUSED,
+                      .bclk = PIN_BCLK,
+                      .ws = PIN_LRC,
+                      .dout = PIN_DIN,
+                      .din = I2S_GPIO_UNUSED,
+                      .invert_flags = {
+                          .mclk_inv = false,
+                          .bclk_inv = false,
+                          .ws_inv = false,
+                      },
+                  },
+              };
+              ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &std_cfg));
+              ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
+
+              while (1) {
+                  ESP_LOGI(TAG, "1 kHz beep");
+                  play_tone(1000.0f, 1000);
+                  play_tone(0, 400);
+                  ESP_LOGI(TAG, "melody");
+                  play_melody();
+                  play_tone(0, 2000);
+              }
+          }
+
+          EOF
+          idf.py set-target esp32s3
+          idf.py build
+          cd build
+          esptool.py --chip esp32s3 merge_bin -o ../../zara-amp-test.bin @flash_args
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: zara-amp-test
+          path: zara-amp-test.bin
+          if-no-files-found: error
